@@ -51,7 +51,8 @@ echo [4/4] Creation de AzerothErasControl.exe...
   --add-data "finalize.sh;." ^
   --collect-all customtkinter ^
   --collect-all cryptography ^
-  --hidden-import windnd ^
+  --collect-all tkinterdnd2 ^
+  --hidden-import tkinterdnd2 ^
   --hidden-import ember_admin ^
   --hidden-import ember_admin_core ^
   --hidden-import ember_admin_files ^
@@ -107,7 +108,7 @@ exit /b 0
 echo.
 echo ==========================================
 echo   ECHEC DU BUILD
- echo ==========================================
+echo ==========================================
 echo.
 echo Aucun nettoyage destructif des sources n'a ete effectue.
 pause
