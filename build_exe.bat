@@ -52,7 +52,9 @@ echo [4/4] Creation de AzerothErasControl.exe...
   --add-data "finalize.sh;." ^
   --collect-all customtkinter ^
   --collect-all cryptography ^
-  ember_admin.py
+  --hidden-import ember_admin ^
+  --hidden-import ember_admin_core ^
+  ember_admin_files.py
 
 if %errorlevel% neq 0 goto :fail
 
