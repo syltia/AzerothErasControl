@@ -7,6 +7,7 @@ import tempfile
 import time
 import sys
 import traceback
+import threading
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
@@ -18,7 +19,6 @@ from ember_admin_files import EmberAdmin as _FilesApp
 
 
 def _crash_log_path():
-    """Keep crash logs next to the EXE when packaged, or next to this script in dev."""
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent / "AzerothErasControl.log"
     return Path(__file__).resolve().parent / "AzerothErasControl.log"
@@ -39,7 +39,6 @@ def _write_crash_log(exc_type, exc_value, exc_tb, context="Unhandled exception")
 
 def _global_exception_hook(exc_type, exc_value, exc_tb):
     _write_crash_log(exc_type, exc_value, exc_tb)
-    # Preserve the normal Python behaviour when a console exists.
     try:
         sys.__excepthook__(exc_type, exc_value, exc_tb)
     except Exception:
@@ -53,7 +52,6 @@ class EmberAdmin(_FilesApp):
     """WinSCP-inspired SFTP quality-of-life layer."""
 
     def report_callback_exception(self, exc, val, tb):
-        """Tkinter callbacks do not go through sys.excepthook, so log them explicitly."""
         _write_crash_log(exc, val, tb, context="Tkinter callback exception")
         try:
             messagebox.showerror(
@@ -68,6 +66,7 @@ class EmberAdmin(_FilesApp):
         super()._install_sftp_enhancements()
 
         self._remote_edit_sessions = {}
+        self._transfer_in_progress = False
 
         for tree in (self.local_tree, self.remote_tree):
             tree.bind("<F5>", self._file_refresh_shortcut, add="+")
@@ -79,6 +78,160 @@ class EmberAdmin(_FilesApp):
         self.local_tree.bind("<Button-3>", self.local_context_menu)
         self.remote_tree.bind("<Button-3>", self.remote_context_menu)
 
+    # ---------- Dedicated transfer channel ----------
+    # Do not share the browser SFTPClient with a worker thread. Paramiko's
+    # SFTPClient is not designed for concurrent requests from multiple threads.
+    def _new_transfer_sftp(self):
+        if not self.ssh:
+            raise RuntimeError("SSH connection is not available.")
+        return self.ssh.open_sftp()
+
+    @staticmethod
+    def _transfer_remote_exists(sftp, path):
+        try:
+            sftp.stat(path)
+            return True
+        except IOError:
+            return False
+
+    def _transfer_remote_mkdirs(self, sftp, path):
+        path = posixpath.normpath(path)
+        parts = []
+        while path not in ("", "/"):
+            parts.append(path)
+            path = posixpath.dirname(path)
+        for folder in reversed(parts):
+            try:
+                sftp.stat(folder)
+            except IOError:
+                sftp.mkdir(folder)
+
+    def _upload_path_on(self, sftp, local, target):
+        local = Path(local)
+        if local.is_dir():
+            self._transfer_remote_mkdirs(sftp, target)
+            for child in local.iterdir():
+                self._upload_path_on(sftp, child, posixpath.join(target, child.name))
+        else:
+            sftp.put(str(local), target)
+
+    def _download_path_on(self, sftp, remote, local, mode=None):
+        if mode is None:
+            mode = sftp.stat(remote).st_mode
+        local = Path(local)
+        if stat.S_ISDIR(mode):
+            local.mkdir(parents=True, exist_ok=True)
+            for child in sftp.listdir_attr(remote):
+                self._download_path_on(
+                    sftp,
+                    posixpath.join(remote, child.filename),
+                    local / child.filename,
+                    child.st_mode,
+                )
+        else:
+            local.parent.mkdir(parents=True, exist_ok=True)
+            sftp.get(remote, str(local))
+
+    def upload_selected(self):
+        if not self.need():
+            return
+        if self._transfer_in_progress:
+            return
+
+        items = list(self._selected_local_paths())
+        if not items:
+            messagebox.showwarning(
+                "SFTP",
+                "Select local files/folders." if self.language.get() == "EN" else "Sélectionne des fichiers/dossiers locaux.",
+            )
+            return
+
+        remote_dir = self.path.get().strip() or "/"
+        conflicts = self._collect_upload_conflicts(items, remote_dir)
+        if not self._confirm_overwrite(conflicts):
+            return
+
+        self._transfer_in_progress = True
+
+        def worker():
+            sftp = None
+            try:
+                sftp = self._new_transfer_sftp()
+                for i, item in enumerate(items, 1):
+                    self.q.put(("transfer", f"Upload {i}/{len(items)} : {item.name}"))
+                    self._upload_path_on(sftp, item, posixpath.join(remote_dir, item.name))
+                self.q.put(("transfer", f"Upload complete ({len(items)} item(s))"))
+                self.q.put(("refresh_remote", None))
+            except Exception as exc:
+                self.q.put(("transfer", f"Error: {exc}"))
+                _write_crash_log(type(exc), exc, exc.__traceback__, context="SFTP upload worker exception")
+            finally:
+                try:
+                    if sftp is not None:
+                        sftp.close()
+                except Exception:
+                    pass
+                self._transfer_in_progress = False
+
+        threading.Thread(target=worker, daemon=True, name="aec-sftp-upload").start()
+
+    def download_selected(self):
+        if not self.need():
+            return
+        if self._transfer_in_progress:
+            return
+
+        entries = list(self._selected_remote_entries())
+        if not entries:
+            messagebox.showwarning(
+                "SFTP",
+                "Select server files/folders." if self.language.get() == "EN" else "Sélectionne des fichiers/dossiers serveur.",
+            )
+            return
+
+        remote_dir = self.path.get().strip() or "/"
+        local_dir = Path(self.local_path.get())
+        conflicts = self._collect_download_conflicts(entries, local_dir)
+        if not self._confirm_overwrite(conflicts):
+            return
+
+        self._transfer_in_progress = True
+
+        def worker():
+            sftp = None
+            try:
+                sftp = self._new_transfer_sftp()
+                for i, e in enumerate(entries, 1):
+                    self.q.put(("transfer", f"Download {i}/{len(entries)} : {e.filename}"))
+                    self._download_path_on(
+                        sftp,
+                        posixpath.join(remote_dir, e.filename),
+                        local_dir / e.filename,
+                        e.st_mode,
+                    )
+                self.q.put(("transfer", f"Download complete ({len(entries)} item(s))"))
+                self.q.put(("refresh_local", None))
+            except Exception as exc:
+                self.q.put(("transfer", f"Error: {exc}"))
+                _write_crash_log(type(exc), exc, exc.__traceback__, context="SFTP download worker exception")
+            finally:
+                try:
+                    if sftp is not None:
+                        sftp.close()
+                except Exception:
+                    pass
+                self._transfer_in_progress = False
+
+        threading.Thread(target=worker, daemon=True, name="aec-sftp-download").start()
+
+    def _files_auto_refresh_tick(self):
+        # Never browse the main SFTP channel while a transfer worker is active.
+        if getattr(self, "_transfer_in_progress", False):
+            self.after(500, self._files_auto_refresh_tick)
+            return
+        super()._files_auto_refresh_tick()
+
+    # ---------- Selection / context helpers ----------
     def _select_row_under_pointer(self, tree, event):
         row = tree.identify_row(event.y)
         if row and row not in tree.selection():
@@ -120,6 +273,8 @@ class EmberAdmin(_FilesApp):
             menu.grab_release()
 
     def _file_refresh_shortcut(self, _event=None):
+        if getattr(self, "_transfer_in_progress", False):
+            return "break"
         try:
             focus = self.focus_get()
             if self._widget_is_or_inside(focus, self.remote_tree):
@@ -133,15 +288,22 @@ class EmberAdmin(_FilesApp):
                 self.list_remote()
         return "break"
 
+    # ---------- Rename ----------
     def _ask_rename(self, old_name, remote=False):
         lang = self.language.get()
-        dlg = ctk.CTkInputDialog(title="Rename" if lang == "EN" else "Renommer", text=(f"New name for {old_name}:" if lang == "EN" else f"Nouveau nom pour {old_name} :"))
+        dlg = ctk.CTkInputDialog(
+            title="Rename" if lang == "EN" else "Renommer",
+            text=(f"New name for {old_name}:" if lang == "EN" else f"Nouveau nom pour {old_name} :"),
+        )
         return dlg.get_input()
 
     def local_rename_selected(self):
         items = self._selected_local_paths()
         if len(items) != 1:
-            messagebox.showwarning("Rename" if self.language.get() == "EN" else "Renommer", "Select exactly one item." if self.language.get() == "EN" else "Sélectionne exactement un élément.")
+            messagebox.showwarning(
+                "Rename" if self.language.get() == "EN" else "Renommer",
+                "Select exactly one item." if self.language.get() == "EN" else "Sélectionne exactement un élément.",
+            )
             return "break"
         src = Path(items[0])
         name = self._ask_rename(src.name)
@@ -166,7 +328,10 @@ class EmberAdmin(_FilesApp):
             return "break"
         entries = self._selected_remote_entries()
         if len(entries) != 1:
-            messagebox.showwarning("Rename" if self.language.get() == "EN" else "Renommer", "Select exactly one item." if self.language.get() == "EN" else "Sélectionne exactement un élément.")
+            messagebox.showwarning(
+                "Rename" if self.language.get() == "EN" else "Renommer",
+                "Select exactly one item." if self.language.get() == "EN" else "Sélectionne exactement un élément.",
+            )
             return "break"
         e = entries[0]
         name = self._ask_rename(e.filename, remote=True)
@@ -188,6 +353,7 @@ class EmberAdmin(_FilesApp):
             messagebox.showerror("SFTP", str(exc))
         return "break"
 
+    # ---------- Local delete ----------
     def local_delete_selected(self):
         items = self._selected_local_paths()
         if not items:
@@ -196,7 +362,11 @@ class EmberAdmin(_FilesApp):
         if len(items) > 10:
             preview += f"\n... +{len(items) - 10}"
         lang = self.language.get()
-        msg = (f"Permanently delete {len(items)} selected item(s)?\n\n{preview}\n\nFolders and all their contents will be deleted." if lang == "EN" else f"Supprimer définitivement les {len(items)} élément(s) sélectionné(s) ?\n\n{preview}\n\nLes dossiers et tout leur contenu seront supprimés.")
+        msg = (
+            f"Permanently delete {len(items)} selected item(s)?\n\n{preview}\n\nFolders and all their contents will be deleted."
+            if lang == "EN"
+            else f"Supprimer définitivement les {len(items)} élément(s) sélectionné(s) ?\n\n{preview}\n\nLes dossiers et tout leur contenu seront supprimés."
+        )
         if not messagebox.askyesno("Delete" if lang == "EN" else "Supprimer", msg):
             return "break"
         try:
@@ -211,6 +381,7 @@ class EmberAdmin(_FilesApp):
             messagebox.showerror("Delete", str(exc))
         return "break"
 
+    # ---------- Remote edit / automatic upload ----------
     def _remote_edit_key(self, remote_path):
         return hashlib.sha256(remote_path.encode("utf-8", errors="replace")).hexdigest()[:16]
 
@@ -219,22 +390,34 @@ class EmberAdmin(_FilesApp):
             return
         entries = self._selected_remote_entries()
         if len(entries) != 1:
-            messagebox.showwarning("Edit" if self.language.get() == "EN" else "Éditer", "Select exactly one remote file." if self.language.get() == "EN" else "Sélectionne exactement un fichier distant.")
+            messagebox.showwarning(
+                "Edit" if self.language.get() == "EN" else "Éditer",
+                "Select exactly one remote file." if self.language.get() == "EN" else "Sélectionne exactement un fichier distant.",
+            )
             return
         e = entries[0]
         if stat.S_ISDIR(e.st_mode):
             messagebox.showwarning("Edit", "Folders cannot be edited." if self.language.get() == "EN" else "Un dossier ne peut pas être édité.")
             return
+
         remote = posixpath.join(self.path.get().strip() or "/", e.filename)
         root = Path(tempfile.gettempdir()) / "AzerothErasControl" / "edit" / self._remote_edit_key(remote)
         root.mkdir(parents=True, exist_ok=True)
         local = root / e.filename
+
         try:
             self.sftp.get(remote, str(local))
             baseline = local.stat().st_mtime_ns
-            self._remote_edit_sessions[remote] = {"local": local, "mtime": baseline, "busy": False, "remote_mtime": int(e.st_mtime or 0)}
+            self._remote_edit_sessions[remote] = {
+                "local": local,
+                "mtime": baseline,
+                "busy": False,
+                "remote_mtime": int(e.st_mtime or 0),
+            }
             self._windows_open_with(local)
-            self.transfer_status.configure(text=(f"Editing: {e.filename}" if self.language.get() == "EN" else f"Édition : {e.filename}"))
+            self.transfer_status.configure(
+                text=(f"Editing: {e.filename}" if self.language.get() == "EN" else f"Édition : {e.filename}")
+            )
             self.after(800, lambda r=remote: self._watch_remote_edit(r))
         except Exception as exc:
             messagebox.showerror("Edit remote file", str(exc))
@@ -247,17 +430,23 @@ class EmberAdmin(_FilesApp):
         if not local.exists():
             self._remote_edit_sessions.pop(remote, None)
             return
+
         try:
             mtime = local.stat().st_mtime_ns
         except Exception:
             self.after(1000, lambda r=remote: self._watch_remote_edit(r))
             return
+
         if mtime != session["mtime"] and not session["busy"]:
             session["mtime"] = mtime
             session["busy"] = True
             name = posixpath.basename(remote)
             lang = self.language.get()
-            msg = (f"{name} was saved locally.\n\nUpload the modified file back to the server?" if lang == "EN" else f"{name} vient d'être sauvegardé localement.\n\nRenvoyer le fichier modifié sur le serveur ?")
+            msg = (
+                f"{name} was saved locally.\n\nUpload the modified file back to the server?"
+                if lang == "EN"
+                else f"{name} vient d'être sauvegardé localement.\n\nRenvoyer le fichier modifié sur le serveur ?"
+            )
             if messagebox.askyesno("Remote edit" if lang == "EN" else "Édition distante", msg):
                 try:
                     try:
@@ -265,7 +454,11 @@ class EmberAdmin(_FilesApp):
                     except Exception:
                         current_remote_mtime = session.get("remote_mtime", 0)
                     if current_remote_mtime != session.get("remote_mtime", 0):
-                        warning = ("The remote file also changed since you opened it. Overwrite it anyway?" if lang == "EN" else "Le fichier distant a aussi été modifié depuis son ouverture. L'écraser quand même ?")
+                        warning = (
+                            "The remote file also changed since you opened it. Overwrite it anyway?"
+                            if lang == "EN"
+                            else "Le fichier distant a aussi été modifié depuis son ouverture. L'écraser quand même ?"
+                        )
                         if not messagebox.askyesno("Conflict" if lang == "EN" else "Conflit", warning):
                             session["busy"] = False
                             self.after(1000, lambda r=remote: self._watch_remote_edit(r))
@@ -275,11 +468,14 @@ class EmberAdmin(_FilesApp):
                         session["remote_mtime"] = int(self.sftp.stat(remote).st_mtime or 0)
                     except Exception:
                         pass
-                    self.transfer_status.configure(text=(f"Uploaded: {name}" if lang == "EN" else f"Renvoyé : {name}"))
+                    self.transfer_status.configure(
+                        text=(f"Uploaded: {name}" if lang == "EN" else f"Renvoyé : {name}")
+                    )
                     self.list_remote()
                 except Exception as exc:
                     messagebox.showerror("SFTP", str(exc))
             session["busy"] = False
+
         self.after(1000, lambda r=remote: self._watch_remote_edit(r))
 
 
