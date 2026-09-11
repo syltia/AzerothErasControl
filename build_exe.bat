@@ -18,7 +18,6 @@ if %errorlevel%==0 (
         echo Installe Python 3 puis coche "Add Python to PATH".
         goto :fail
     )
-    set "PY=python"
 )
 
 echo [1/4] Python detecte :
@@ -54,7 +53,8 @@ echo [4/4] Creation de AzerothErasControl.exe...
   --collect-all cryptography ^
   --hidden-import ember_admin ^
   --hidden-import ember_admin_core ^
-  ember_admin_files.py
+  --hidden-import ember_admin_files ^
+  ember_admin_winscp.py
 
 if %errorlevel% neq 0 goto :fail
 
