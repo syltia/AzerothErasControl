@@ -6,33 +6,33 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-echo "--- 1. Configuration de SSH ---"
+echo "--- 1. SSH configuration ---"
 sed -ie '0,/#PermitRootLogin prohibit-password/s/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
 service sshd restart
 
-echo "--- 2. Configuration du firewall UFW ---"
-echo "Ajout des règles pour SSH et les ports du serveur WoW."
+echo "--- 2. UFW firewall configuration ---"
+echo "Adding rules for SSH and WoW server ports."
 ufw default deny incoming
 ufw default allow outgoing
-ufw allow 22/tcp comment 'SSH - Administration a distance'
-ufw allow 3724/tcp comment 'AzerothCore - Authserver (connexion / realmlist)'
-ufw allow 8085/tcp comment 'AzerothCore - Worldserver (jeu)'
-echo "Activation du firewall UFW..."
+ufw allow 22/tcp comment 'SSH - Remote administration'
+ufw allow 3724/tcp comment 'AzerothCore - Authserver (connection / realmlist)'
+ufw allow 8085/tcp comment 'AzerothCore - Worldserver (game)'
+echo "Enabling UFW firewall..."
 ufw --force enable
-echo "UFW est maintenant actif. Règles appliquées :"
+echo "UFW is now active. Applied rules:"
 ufw status verbose
 
-echo "--- 3. Configuration de GRUB ---"
+echo "--- 3. GRUB configuration ---"
 sed -i 's/^GRUB_DEFAULT=.*/GRUB_DEFAULT=1/' /etc/default/grub
 sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=0/' /etc/default/grub
 update-grub
 
-echo "--- 4. Configuration de l'IP Statique ---"
+echo "--- 4. Static IP configuration ---"
 INTERFACE=$(ip -o link show | awk -F': ' '$2 != "lo" {print $2; exit}')
 CURRENT_IP=$(ip -4 addr show $INTERFACE | grep -oP '(?<=inet )\d+(\.\d+){3}')
 GATEWAY=$(ip route | grep default | awk '{print $3}')
 
-echo "Application de l'IP statique : $CURRENT_IP sur l'interface $INTERFACE (Passerelle : $GATEWAY)"
+echo "Applying static IP: $CURRENT_IP on interface $INTERFACE (Gateway: $GATEWAY)"
 
 cat <<EOF > /etc/network/interfaces
 source /etc/network/interfaces.d/*
@@ -51,14 +51,14 @@ EOF
 
 systemctl restart networking.service
 
-echo "--- 5. Clonage AzerothCore et module principal ---"
+echo "--- 5. Cloning AzerothCore and main module ---"
 cd ~
 git clone https://github.com/mod-playerbots/azerothcore-wotlk.git --branch=Playerbot
 
 cd ~/azerothcore-wotlk/modules
 git clone https://github.com/mod-playerbots/mod-playerbots.git --branch=master
 
-echo "--- 6. Ajout des sous-modules personnalisés ---"
+echo "--- 6. Adding custom submodules ---"
 cd ~/azerothcore-wotlk
 git submodule add -f https://github.com/ZhengPeiRu21/mod-individual-progression modules/mod-individual-progression
 git submodule add -f https://github.com/azerothcore/mod-ah-bot modules/mod-ah-bot
@@ -67,10 +67,10 @@ git submodule add -f https://github.com/Wishmaster117/mod-multibot-bridge module
 git submodule add -f https://github.com/azerothcore/mod-account-mounts modules/mod-account-mounts
 git submodule add -f https://github.com/azerothcore/eluna-ts modules/eluna-ts
 
-echo "--- 7. Téléchargement du script finalize Ember ---"
+echo "--- 7. Downloading Ember finalize script ---"
 curl -o /root/finalize.sh https://raw.githubusercontent.com/syltia/project-ember/main/finalize.sh && chmod +x /root/finalize.sh
 
-echo "--- 8. Création du script de démarrage et des alias ---"
+echo "--- 8. Creating startup script and aliases ---"
 cat << 'EOF' > /root/start.sh
 #!/bin/bash
 
@@ -151,20 +151,20 @@ EOF
 
 source ~/.bashrc
 
-echo "--- 9. Lancement du script des dépendances d'AzerothCore ---"
+echo "--- 9. Running AzerothCore dependency installer ---"
 cd ~/azerothcore-wotlk
 ./acore.sh install-deps
 
 echo "=================================================================="
-echo "Script de préparation Ember terminé ! Votre machine est prête."
+echo "Ember preparation script completed! Your machine is ready."
 echo "=================================================================="
 echo ""
 
-read -p "Voulez-vous lancer la compilation maintenant ? (o/n) : " choice
-if [[ "$choice" =~ ^[oO](ui)?$|[yY](es)?$ ]]; then
-    echo "Lancement de la compilation..."
+read -p "Would you like to start the compilation now? (y/n): " choice
+if [[ "$choice" =~ ^[yY](es)?$ ]]; then
+    echo "Starting compilation..."
     cd ~/azerothcore-wotlk
     ./acore.sh compiler all
 else
-    echo "Compilation ignorée. Vous pourrez la lancer plus tard avec l'alias : compile"
+    echo "Compilation skipped. You can start it later using the alias: compile"
 fi
