@@ -21,6 +21,7 @@ class EmberAdmin(_CurrentApp):
         self._sftp_drag_source = None
         self._sftp_drag_active = False
         self._sftp_drag_start = (0, 0)
+        self._sftp_selection_anchor = {"local": None, "remote": None}
         self._files_auto_refresh_busy = False
         self._local_signature = None
         self._remote_signature = None
@@ -34,15 +35,21 @@ class EmberAdmin(_CurrentApp):
         self.local_tree.bind("<Double-Button-1>", self.local_open)
         self.remote_tree.bind("<Double-Button-1>", self.remote_open)
 
+        # We handle left-click selection ourselves so Ctrl/Shift multi-selection
+        # remains intact when a drag starts on an already selected row.
         self.local_tree.bind(
-            "<ButtonPress-1>", lambda e: self._remember_drag("local", e), add="+"
+            "<ButtonPress-1>", lambda e: self._tree_press("local", self.local_tree, e)
         )
         self.remote_tree.bind(
-            "<ButtonPress-1>", lambda e: self._remember_drag("remote", e), add="+"
+            "<ButtonPress-1>", lambda e: self._tree_press("remote", self.remote_tree, e)
         )
-        self.local_tree.bind("<B1-Motion>", self._drag_motion, add="+")
-        self.remote_tree.bind("<B1-Motion>", self._drag_motion, add="+")
+        self.local_tree.bind("<B1-Motion>", self._drag_motion)
+        self.remote_tree.bind("<B1-Motion>", self._drag_motion)
         self.bind_all("<ButtonRelease-1>", self._finish_drag, add="+")
+
+        # Ctrl+A is convenient and also gives us a deterministic multi-select path.
+        self.local_tree.bind("<Control-a>", lambda e: self._select_all_tree(self.local_tree))
+        self.remote_tree.bind("<Control-a>", lambda e: self._select_all_tree(self.remote_tree))
 
         self._install_file_navigation_buttons()
 
@@ -58,6 +65,58 @@ class EmberAdmin(_CurrentApp):
 
         self._update_file_signatures()
         self.after(1800, self._files_auto_refresh_tick)
+
+    def _tree_press(self, side, tree, event):
+        row = tree.identify_row(event.y)
+        self._sftp_drag_source = side if row else None
+        self._sftp_drag_active = False
+        self._sftp_drag_start = (event.x_root, event.y_root)
+
+        if not row:
+            tree.selection_remove(tree.selection())
+            self._sftp_selection_anchor[side] = None
+            return "break"
+
+        ctrl = bool(event.state & 0x0004)
+        shift = bool(event.state & 0x0001)
+        selected = set(tree.selection())
+
+        if shift:
+            children = list(tree.get_children(""))
+            anchor = self._sftp_selection_anchor.get(side)
+            if anchor not in children:
+                anchor = tree.focus() if tree.focus() in children else row
+            try:
+                a = children.index(anchor)
+                b = children.index(row)
+                lo, hi = sorted((a, b))
+                tree.selection_set(children[lo : hi + 1])
+            except ValueError:
+                tree.selection_set(row)
+            tree.focus(row)
+        elif ctrl:
+            if row in selected:
+                tree.selection_remove(row)
+            else:
+                tree.selection_add(row)
+            tree.focus(row)
+            self._sftp_selection_anchor[side] = row
+        else:
+            # If several rows are already selected and the user presses one of
+            # them, keep the whole selection so dragging transfers them all.
+            if not (row in selected and len(selected) > 1):
+                tree.selection_set(row)
+            tree.focus(row)
+            self._sftp_selection_anchor[side] = row
+
+        return "break"
+
+    def _select_all_tree(self, tree):
+        children = tree.get_children("")
+        if children:
+            tree.selection_set(children)
+            tree.focus(children[0])
+        return "break"
 
     def _find_local_path_entry(self):
         root = self.pages.get("Fichiers")
@@ -253,17 +312,13 @@ class EmberAdmin(_CurrentApp):
                 return
         subprocess.Popen(["xdg-open", path])
 
-    def _remember_drag(self, side, event):
-        self._sftp_drag_source = side
-        self._sftp_drag_active = False
-        self._sftp_drag_start = (event.x_root, event.y_root)
-
     def _drag_motion(self, event):
         if not self._sftp_drag_source:
-            return
+            return "break"
         x0, y0 = self._sftp_drag_start
         if abs(event.x_root - x0) + abs(event.y_root - y0) >= 8:
             self._sftp_drag_active = True
+        return "break"
 
     @staticmethod
     def _widget_is_or_inside(widget, ancestor):
@@ -287,10 +342,14 @@ class EmberAdmin(_CurrentApp):
             target = self.winfo_containing(event.x_root, event.y_root)
         except Exception:
             return
+
+        # Important: do not start SFTP work from inside Tk's ButtonRelease
+        # dispatch. Let the mouse event unwind first; this avoids the native
+        # Tk/Windows crash observed after a successful drop.
         if source == "local" and self._widget_is_or_inside(target, self.remote_tree):
-            self.upload_selected()
+            self.after_idle(self.upload_selected)
         elif source == "remote" and self._widget_is_or_inside(target, self.local_tree):
-            self.download_selected()
+            self.after_idle(self.download_selected)
 
     def _get_local_signature(self):
         try:
@@ -339,7 +398,7 @@ class EmberAdmin(_CurrentApp):
 
     def _files_auto_refresh_tick(self):
         try:
-            if self.current_page == "Fichiers" and not self._files_auto_refresh_busy:
+            if getattr(self, "current_page", None) == "Fichiers" and not self._files_auto_refresh_busy:
                 self._files_auto_refresh_busy = True
 
                 local_sig = self._get_local_signature()
