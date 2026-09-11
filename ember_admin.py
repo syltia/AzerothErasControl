@@ -1507,16 +1507,30 @@ class EmberAdmin(ctk.CTk):
         def worker():
             try:
                 _,stdout,stderr=self.ssh.exec_command(cmd,get_pty=True)
-                output=stdout.read().decode(errors="replace")+stderr.read().decode(errors="replace")
-                rc=stdout.channel.recv_exit_status()
+                channel=stdout.channel
+
+                while True:
+                    if channel.recv_ready():
+                        data=channel.recv(4096).decode("utf-8",errors="replace")
+                        if data:
+                            self.q.put(("install_log",data))
+                    elif channel.exit_status_ready():
+                        while channel.recv_ready():
+                            data=channel.recv(4096).decode("utf-8",errors="replace")
+                            if data:
+                                self.q.put(("install_log",data))
+                        break
+                    else:
+                        import time
+                        time.sleep(0.04)
+
+                rc=channel.recv_exit_status()
 
                 def finish():
-                    if output.strip():
-                        self.install_out.insert("end",output+"\n")
                     self.install_out.insert(
                         "end",
-                        "==> Étape 1 terminée avec succès.\n" if rc == 0
-                        else f"==> Échec de l'étape 1 (code {rc}).\n"
+                        "\n==> Étape 1 terminée avec succès.\n" if rc == 0
+                        else f"\n==> Échec de l'étape 1 (code {rc}).\n"
                     )
                     self.install_out.see("end")
 
@@ -3454,6 +3468,10 @@ ORDER BY a.username,c.name;"""
                     self._render_connection_state(state_map.get(v,"disconnected"))
                 elif t=="log":self.console.insert("end",v);self.console.see("end")
                 elif t=="shell":self.console.insert("end",v);self.console.see("end")
+                elif t=="install_log":
+                    if hasattr(self,"install_out"):
+                        self.install_out.insert("end",v)
+                        self.install_out.see("end")
                 elif t=="monitor":
                     vals,data=v
                     self._set_monitor_ui(vals,data)
