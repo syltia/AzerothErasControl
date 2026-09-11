@@ -51,10 +51,12 @@ echo [4/4] Creation de AzerothErasControl.exe...
   --add-data "finalize.sh;." ^
   --collect-all customtkinter ^
   --collect-all cryptography ^
+  --hidden-import windnd ^
   --hidden-import ember_admin ^
   --hidden-import ember_admin_core ^
   --hidden-import ember_admin_files ^
-  ember_admin_winscp.py
+  --hidden-import ember_admin_winscp ^
+  ember_admin_winscp_pro.py
 
 if %errorlevel% neq 0 goto :fail
 
@@ -105,7 +107,7 @@ exit /b 0
 echo.
 echo ==========================================
 echo   ECHEC DU BUILD
-echo ==========================================
+ echo ==========================================
 echo.
 echo Aucun nettoyage destructif des sources n'a ete effectue.
 pause
