@@ -88,6 +88,8 @@ The build script installs the Python dependencies and PyInstaller, builds `Azero
 
 The server installation procedure and setup scripts have been tested on **Debian 13.6** as of **September 11, 2026**.
 
+When using **Step 1 - Prepare Debian**, the `apt` update, upgrade and package installation output is streamed live in the Installation log. The step is only complete once the final success message is displayed.
+
 The companion AzerothCore server installation scripts and documentation are maintained here:
 
 https://github.com/syltia/wow
