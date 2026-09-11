@@ -4,6 +4,10 @@
 
 It is designed for private AzerothCore environments and provides remote server administration over SSH/SFTP without requiring the MySQL port to be exposed publicly.
 
+## Preview
+
+![Azeroth Eras Control Dashboard](docs/dashboard.png)
+
 ## Features
 
 - Persistent SSH console with interactive shell support
