@@ -1,5 +1,12 @@
 import customtkinter as ctk
 from tkinter import messagebox
+import os
+import posixpath
+import stat
+import subprocess
+import tempfile
+import threading
+from pathlib import Path
 
 from ember_admin_core import EmberAdmin as _EmberAdminBase
 
@@ -8,6 +15,7 @@ class EmberAdmin(_EmberAdminBase):
     def __init__(self):
         super().__init__()
         self._install_dashboard_action_controls()
+        self._install_sftp_enhancements()
 
     def _find_dashboard_button(self, text):
         root=self.pages.get("Dashboard")
@@ -61,6 +69,248 @@ class EmberAdmin(_EmberAdminBase):
 
         if update_btn is not None:
             update_btn.configure(command=self.update_core_and_modules)
+
+    # ---------- SFTP enhancements ----------
+    def _install_sftp_enhancements(self):
+        """WinSCP-like quality-of-life additions without touching the SSH core."""
+        self._sftp_drag_source=None
+        self.local_tree.configure(selectmode="extended")
+        self.remote_tree.configure(selectmode="extended")
+
+        # Double-click opens folders; files use Windows "Open with".
+        self.local_tree.bind("<Double-Button-1>",self.local_open)
+        self.remote_tree.bind("<Double-Button-1>",self.remote_open)
+
+        # Drag selected entries between the two panes.
+        self.local_tree.bind("<ButtonPress-1>",lambda e:self._remember_drag("local"),add="+")
+        self.remote_tree.bind("<ButtonPress-1>",lambda e:self._remember_drag("remote"),add="+")
+        self.local_tree.bind("<ButtonRelease-1>",self._finish_drag,add="+")
+        self.remote_tree.bind("<ButtonRelease-1>",self._finish_drag,add="+")
+
+    def _remember_drag(self,side):
+        self._sftp_drag_source=side
+
+    def _finish_drag(self,event):
+        source=self._sftp_drag_source
+        self._sftp_drag_source=None
+        try:
+            target=self.winfo_containing(event.x_root,event.y_root)
+        except Exception:
+            return
+        if source=="local" and target is self.remote_tree:
+            self.upload_selected()
+        elif source=="remote" and target is self.local_tree:
+            self.download_selected()
+
+    def _selected_local_paths(self):
+        return [self.local_entries[i] for i in self.local_tree.selection() if i in self.local_entries]
+
+    def _selected_remote_entries(self):
+        return [self.remote_entries[i] for i in self.remote_tree.selection() if i in self.remote_entries]
+
+    def _remote_exists(self,path):
+        try:
+            self.sftp.stat(path)
+            return True
+        except IOError:
+            return False
+
+    def _remote_mkdirs(self,path):
+        path=posixpath.normpath(path)
+        parts=[]
+        while path not in ("","/"):
+            parts.append(path)
+            path=posixpath.dirname(path)
+        for folder in reversed(parts):
+            try:
+                self.sftp.stat(folder)
+            except IOError:
+                self.sftp.mkdir(folder)
+
+    def _collect_upload_conflicts(self,items,remote_dir):
+        conflicts=[]
+        for item in items:
+            target=posixpath.join(remote_dir,item.name)
+            if self._remote_exists(target):
+                conflicts.append(target)
+        return conflicts
+
+    def _collect_download_conflicts(self,entries,local_dir):
+        return [str(local_dir/e.filename) for e in entries if (local_dir/e.filename).exists()]
+
+    def _confirm_overwrite(self,conflicts):
+        if not conflicts:
+            return True
+        preview="\n".join(conflicts[:8])
+        if len(conflicts)>8:
+            preview+=f"\n... +{len(conflicts)-8}"
+        msg=(
+            f"{len(conflicts)} item(s) already exist at the destination.\n\n"
+            f"{preview}\n\nOverwrite them?"
+            if self.language.get()=="EN" else
+            f"{len(conflicts)} élément(s) existent déjà à destination.\n\n"
+            f"{preview}\n\nLes écraser ?"
+        )
+        return messagebox.askyesno("Overwrite" if self.language.get()=="EN" else "Écrasement",msg)
+
+    def _upload_path(self,local,target):
+        local=Path(local)
+        if local.is_dir():
+            self._remote_mkdirs(target)
+            for child in local.iterdir():
+                self._upload_path(child,posixpath.join(target,child.name))
+        else:
+            self.sftp.put(str(local),target)
+
+    def _download_path(self,remote,local,mode=None):
+        if mode is None:
+            mode=self.sftp.stat(remote).st_mode
+        local=Path(local)
+        if stat.S_ISDIR(mode):
+            local.mkdir(parents=True,exist_ok=True)
+            for child in self.sftp.listdir_attr(remote):
+                self._download_path(
+                    posixpath.join(remote,child.filename),
+                    local/child.filename,
+                    child.st_mode
+                )
+        else:
+            local.parent.mkdir(parents=True,exist_ok=True)
+            self.sftp.get(remote,str(local))
+
+    def upload_selected(self):
+        if not self.need():
+            return
+        items=self._selected_local_paths()
+        if not items:
+            messagebox.showwarning("SFTP","Select local files/folders." if self.language.get()=="EN" else "Sélectionne des fichiers/dossiers locaux.")
+            return
+        remote_dir=self.path.get().strip() or "/"
+        conflicts=self._collect_upload_conflicts(items,remote_dir)
+        if not self._confirm_overwrite(conflicts):
+            return
+
+        def worker():
+            try:
+                for i,item in enumerate(items,1):
+                    self.q.put(("transfer",f"Upload {i}/{len(items)} : {item.name}"))
+                    self._upload_path(item,posixpath.join(remote_dir,item.name))
+                self.q.put(("transfer",f"Upload complete ({len(items)} item(s))"))
+                self.q.put(("refresh_remote",None))
+            except Exception as exc:
+                self.q.put(("transfer",f"Error: {exc}"))
+        threading.Thread(target=worker,daemon=True).start()
+
+    def download_selected(self):
+        if not self.need():
+            return
+        entries=self._selected_remote_entries()
+        if not entries:
+            messagebox.showwarning("SFTP","Select server files/folders." if self.language.get()=="EN" else "Sélectionne des fichiers/dossiers serveur.")
+            return
+        remote_dir=self.path.get().strip() or "/"
+        local_dir=Path(self.local_path.get())
+        conflicts=self._collect_download_conflicts(entries,local_dir)
+        if not self._confirm_overwrite(conflicts):
+            return
+
+        def worker():
+            try:
+                for i,e in enumerate(entries,1):
+                    self.q.put(("transfer",f"Download {i}/{len(entries)} : {e.filename}"))
+                    self._download_path(
+                        posixpath.join(remote_dir,e.filename),
+                        local_dir/e.filename,
+                        e.st_mode
+                    )
+                self.q.put(("transfer",f"Download complete ({len(entries)} item(s))"))
+                self.q.put(("refresh_local",None))
+            except Exception as exc:
+                self.q.put(("transfer",f"Error: {exc}"))
+        threading.Thread(target=worker,daemon=True).start()
+
+    def _remote_remove_recursive(self,path,mode=None):
+        if mode is None:
+            mode=self.sftp.stat(path).st_mode
+        if stat.S_ISDIR(mode):
+            for child in self.sftp.listdir_attr(path):
+                self._remote_remove_recursive(posixpath.join(path,child.filename),child.st_mode)
+            self.sftp.rmdir(path)
+        else:
+            self.sftp.remove(path)
+
+    def remote_delete_selected(self):
+        if not self.need():
+            return "break"
+        entries=self._selected_remote_entries()
+        if not entries:
+            return "break"
+        base=self.path.get().strip() or "/"
+        paths=[posixpath.join(base,e.filename) for e in entries]
+        preview="\n".join(paths[:10])
+        if len(paths)>10:
+            preview+=f"\n... +{len(paths)-10}"
+        msg=(
+            f"Permanently delete {len(paths)} selected item(s)?\n\n{preview}\n\nFolders and all their contents will be deleted."
+            if self.language.get()=="EN" else
+            f"Supprimer définitivement les {len(paths)} élément(s) sélectionné(s) ?\n\n{preview}\n\nLes dossiers et tout leur contenu seront supprimés."
+        )
+        if not messagebox.askyesno("Delete" if self.language.get()=="EN" else "Supprimer",msg):
+            return "break"
+        try:
+            for path,e in zip(paths,entries):
+                self._remote_remove_recursive(path,e.st_mode)
+            self.list_remote()
+        except Exception as exc:
+            messagebox.showerror("SFTP",str(exc))
+        return "break"
+
+    def _windows_open_with(self,path):
+        path=str(Path(path))
+        if os.name=="nt":
+            subprocess.Popen(["rundll32.exe","shell32.dll,OpenAs_RunDLL",path])
+        else:
+            subprocess.Popen(["xdg-open",path])
+
+    def local_open(self,event=None):
+        sel=self.local_tree.selection()
+        if not sel:
+            return
+        item=self.local_entries.get(sel[0])
+        if not item:
+            return
+        if item.is_dir():
+            self.local_path.set(str(item))
+            self.list_local()
+        else:
+            try:
+                self._windows_open_with(item)
+            except Exception as exc:
+                messagebox.showerror("Open file",str(exc))
+
+    def remote_open(self,event=None):
+        sel=self.remote_tree.selection()
+        if not sel:
+            return
+        e=self.remote_entries.get(sel[0])
+        if not e:
+            return
+        remote=posixpath.join(self.path.get().strip() or "/",e.filename)
+        if stat.S_ISDIR(e.st_mode):
+            self.path.delete(0,"end")
+            self.path.insert(0,remote)
+            self.list_remote()
+            return
+
+        # Remote files are downloaded to a temporary preview directory first.
+        preview_dir=Path(tempfile.gettempdir())/"AzerothErasControl"/"preview"
+        preview_dir.mkdir(parents=True,exist_ok=True)
+        local=preview_dir/e.filename
+        try:
+            self.sftp.get(remote,str(local))
+            self._windows_open_with(local)
+        except Exception as exc:
+            messagebox.showerror("Open file",str(exc))
 
     def schedule_world_action(self, action):
         if not self.need():
