@@ -7,5 +7,5 @@ if errorlevel 1 (
     py -m pip install -r requirements.txt
 )
 
-start "" pyw ember_admin.py
+start "" pyw ember_admin_files.py
 exit
