@@ -86,6 +86,8 @@ The build script installs the Python dependencies and PyInstaller, builds `Azero
 
 ## Server installation
 
+The server installation procedure and setup scripts have been tested on **Debian 13.6** as of **September 11, 2026**.
+
 The companion AzerothCore server installation scripts and documentation are maintained here:
 
 https://github.com/syltia/wow
