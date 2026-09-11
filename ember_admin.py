@@ -1,4 +1,5 @@
 import customtkinter as ctk
+from tkinter import messagebox
 
 from ember_admin_core import EmberAdmin as _EmberAdminBase
 
@@ -50,6 +51,14 @@ class EmberAdmin(_EmberAdminBase):
                 text_color="gray65"
             ).pack(side="left",padx=(4,0))
 
+            ctk.CTkButton(
+                stop_btn.master,
+                text="⚡ Server controls",
+                width=125,
+                fg_color="gray30",
+                command=self.open_server_controls
+            ).pack(side="left",padx=(2,5),pady=10,after=delay_box)
+
         if update_btn is not None:
             update_btn.configure(command=self.update_core_and_modules)
 
@@ -78,6 +87,95 @@ class EmberAdmin(_EmberAdminBase):
             "log",
             f"[Worldserver] {label} scheduled in {delay} second(s).\n"
         ))
+
+    def open_server_controls(self):
+        if not self.need():
+            return
+
+        dlg=ctk.CTkToplevel(self)
+        dlg.title("Server controls")
+        dlg.geometry("420x300")
+        dlg.resizable(False,False)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        ctk.CTkLabel(
+            dlg,
+            text="Emergency server controls",
+            font=ctk.CTkFont(size=21,weight="bold")
+        ).pack(pady=(24,4))
+        ctk.CTkLabel(
+            dlg,
+            text="Authserver can be controlled independently from Worldserver.",
+            text_color="gray70"
+        ).pack(pady=(0,18))
+
+        row=ctk.CTkFrame(dlg,fg_color="transparent")
+        row.pack(pady=5)
+        ctk.CTkButton(row,text="▶ Start auth",width=115,command=lambda:self.auth_action("start",dlg)).pack(side="left",padx=4)
+        ctk.CTkButton(row,text="↻ Restart auth",width=115,command=lambda:self.auth_action("restart",dlg)).pack(side="left",padx=4)
+        ctk.CTkButton(row,text="■ Stop auth",width=115,command=lambda:self.auth_action("stop",dlg)).pack(side="left",padx=4)
+
+        ctk.CTkButton(
+            dlg,
+            text="■ Stop ALL tmux sessions",
+            width=250,
+            fg_color="#8c3434",
+            hover_color="#6f2929",
+            command=lambda:self.stop_all_sessions(dlg)
+        ).pack(pady=(20,7))
+        ctk.CTkLabel(
+            dlg,
+            text="Emergency only — stops Authserver and Worldserver sessions.",
+            text_color="gray60",
+            font=ctk.CTkFont(size=11)
+        ).pack()
+
+    def auth_action(self, action, dialog=None):
+        if not self.need():
+            return
+
+        base="cd /root/azerothcore-wotlk/env/dist/bin"
+        if action=="start":
+            command=(
+                f"{base} && "
+                "if tmux has-session -t auth-session 2>/dev/null; then "
+                "cmd=$(tmux display-message -p -t auth-session '#{pane_current_command}'); "
+                "if [ \"$cmd\" = \"authserver\" ]; then echo 'Authserver is already running.'; "
+                "else tmux send-keys -t auth-session './authserver' C-m; echo 'Authserver started.'; fi; "
+                "else tmux new-session -d -s auth-session './authserver'; echo 'Authserver session created and started.'; fi"
+            )
+        elif action=="restart":
+            command=(
+                f"{base} && "
+                "if tmux has-session -t auth-session 2>/dev/null; then "
+                "tmux send-keys -t auth-session C-c; sleep 2; "
+                "tmux send-keys -t auth-session './authserver' C-m; echo 'Authserver restarted.'; "
+                "else tmux new-session -d -s auth-session './authserver'; echo 'Authserver session created and started.'; fi"
+            )
+        else:
+            command=(
+                "if tmux has-session -t auth-session 2>/dev/null; then "
+                "tmux send-keys -t auth-session C-c; echo 'Authserver stop requested.'; "
+                "else echo 'Authserver session does not exist.'; fi"
+            )
+
+        if dialog is not None:
+            dialog.destroy()
+        self.run(command)
+
+    def stop_all_sessions(self, dialog=None):
+        if not self.need():
+            return
+        if not messagebox.askyesno(
+            "Stop all",
+            "Stop ALL tmux sessions?\n\nThis immediately stops Authserver and Worldserver.",
+            parent=dialog or self
+        ):
+            return
+        if dialog is not None:
+            dialog.destroy()
+        self.run("tmux kill-server 2>/dev/null || true; echo 'All tmux sessions stopped.'")
 
     def update_core_and_modules(self):
         if not self.need():
