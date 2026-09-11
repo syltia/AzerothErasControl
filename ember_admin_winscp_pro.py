@@ -1,23 +1,21 @@
 import os
 from pathlib import Path
 
-from tkinter import messagebox
-
 from ember_admin_winscp import EmberAdmin as _WinSCPApp
 
 try:
-    import windnd
+    from tkinterdnd2 import DND_FILES, TkinterDnD
 except Exception:
-    windnd = None
+    DND_FILES = None
+    TkinterDnD = None
 
 
 class EmberAdmin(_WinSCPApp):
-    """Final WinSCP-like interaction layer for the SFTP file manager."""
+    """WinSCP-like interaction layer with safer Windows drag/drop."""
 
     def _install_sftp_enhancements(self):
         super()._install_sftp_enhancements()
 
-        # Force real extended selection on both panes.
         self.local_tree.configure(selectmode="extended")
         self.remote_tree.configure(selectmode="extended")
         self._selection_anchor = {"local": None, "remote": None}
@@ -25,7 +23,6 @@ class EmberAdmin(_WinSCPApp):
         self._install_selection_bindings(self.local_tree, "local")
         self._install_selection_bindings(self.remote_tree, "remote")
 
-        # Preserve a multi-selection when a drag starts on an already selected row.
         self.local_tree.bind(
             "<ButtonPress-1>",
             lambda e: self._file_drag_press("local", self.local_tree, e),
@@ -34,12 +31,21 @@ class EmberAdmin(_WinSCPApp):
             "<ButtonPress-1>",
             lambda e: self._file_drag_press("remote", self.remote_tree, e),
         )
-
-        # Re-install motion bindings because ButtonPress above replaces only that sequence.
         self.local_tree.bind("<B1-Motion>", self._drag_motion, add="+")
         self.remote_tree.bind("<B1-Motion>", self._drag_motion, add="+")
 
-        # Native Windows Explorer -> remote pane drag and drop.
+        # The previous layer used bind_all(<ButtonRelease-1>). Remove that global
+        # Tcl/Tk callback and scope drag completion to the two file panes only.
+        try:
+            self.unbind_all("<ButtonRelease-1>")
+        except Exception:
+            pass
+        self.local_tree.bind("<ButtonRelease-1>", self._safe_finish_drag, add="+")
+        self.remote_tree.bind("<ButtonRelease-1>", self._safe_finish_drag, add="+")
+
+        # Explorer -> SFTP now uses TkDND instead of windnd. windnd's native
+        # Windows message hook could terminate the process without a Python
+        # exception/log after a successful drop.
         if os.name == "nt":
             self.after(350, self._install_windows_explorer_drop)
 
@@ -53,14 +59,8 @@ class EmberAdmin(_WinSCPApp):
             "<Shift-Button-1>",
             lambda e, t=tree, s=side: self._tree_shift_click(t, s, e),
         )
-        tree.bind(
-            "<Control-a>",
-            lambda e, t=tree: self._tree_select_all(t),
-        )
-        tree.bind(
-            "<Control-A>",
-            lambda e, t=tree: self._tree_select_all(t),
-        )
+        tree.bind("<Control-a>", lambda e, t=tree: self._tree_select_all(t))
+        tree.bind("<Control-A>", lambda e, t=tree: self._tree_select_all(t))
 
     def _tree_ctrl_click(self, tree, side, event):
         row = tree.identify_row(event.y)
@@ -103,70 +103,95 @@ class EmberAdmin(_WinSCPApp):
         return "break"
 
     def _file_drag_press(self, side, tree, event):
-        # Ctrl/Shift are handled by the dedicated bindings above.
+        # Dedicated Ctrl/Shift bindings manage modified clicks.
         if event.state & 0x0005:
             return None
 
         row = tree.identify_row(event.y)
         selected = tree.selection()
 
-        # Record drag state before ttk's class binding changes the selection.
-        self._remember_drag(side, event)
+        # Initialise drag state directly. This avoids depending on another class
+        # binding while keeping a multi-selection intact.
+        self._sftp_drag_source = side if row else None
+        self._sftp_drag_active = False
+        self._sftp_drag_start = (event.x_root, event.y_root)
 
         if row:
             self._selection_anchor[side] = row
 
-        # Important: dragging one of several selected rows must NOT collapse the
-        # selection to a single row before the drag starts.
         if row and row in selected and len(selected) > 1:
             tree.focus(row)
             return "break"
         return None
 
-    # ---------- Windows Explorer -> SFTP pane ----------
+    def _safe_finish_drag(self, event):
+        source = getattr(self, "_sftp_drag_source", None)
+        active = bool(getattr(self, "_sftp_drag_active", False))
+        self._sftp_drag_source = None
+        self._sftp_drag_active = False
+
+        if not source or not active:
+            return "break"
+
+        target = event.widget
+        if source == "local" and self._widget_is_or_inside(target, self.remote_tree):
+            self.after(75, self.upload_selected)
+        elif source == "remote" and self._widget_is_or_inside(target, self.local_tree):
+            self.after(75, self.download_selected)
+        return "break"
+
+    # ---------- Windows Explorer -> SFTP pane via TkDND ----------
     def _install_windows_explorer_drop(self):
-        if windnd is None:
+        if TkinterDnD is None or DND_FILES is None:
             self.transfer_status.configure(
                 text=(
-                    "Explorer drag/drop unavailable: install windnd"
+                    "Explorer drag/drop unavailable: install tkinterdnd2"
                     if self.language.get() == "EN"
-                    else "Glisser-déposer Explorateur indisponible : installe windnd"
+                    else "Glisser-déposer Explorateur indisponible : installe tkinterdnd2"
                 )
             )
             return
 
         try:
-            # Hook the actual remote Treeview so dropping files directly onto the
-            # server pane uploads them to the currently displayed remote folder.
-            windnd.hook_dropfiles(self.remote_tree, func=self._windows_files_dropped)
+            # Load the tkdnd Tcl extension into the already existing CTk root.
+            # tkinterdnd2 patches tkinter.BaseWidget with drop_target_register
+            # and dnd_bind, so the existing ttk.Treeview can be used directly.
+            TkinterDnD._require(self)
+            self.remote_tree.drop_target_register(DND_FILES)
+            self.remote_tree.dnd_bind("<<Drop>>", self._windows_files_dropped)
         except Exception as exc:
             self.transfer_status.configure(text=f"Windows DnD error: {exc}")
 
-    def _windows_files_dropped(self, filenames):
+    def _windows_files_dropped(self, event):
+        try:
+            raw_items = self.tk.splitlist(event.data)
+        except Exception:
+            raw_items = [event.data]
+
         paths = []
-        for raw in filenames:
+        for raw in raw_items:
             try:
-                p = Path(os.fsdecode(raw))
+                p = Path(str(raw).strip().strip("{}"))
             except Exception:
                 continue
             if p.exists():
                 paths.append(p)
 
-        if not paths:
-            return
-
-        # windnd callback can come from a Windows message callback; marshal the
-        # actual UI/SFTP operation back onto Tk's event loop.
-        self.after(0, lambda p=paths: self._upload_external_paths(p))
+        if paths:
+            # Let the TkDND callback return before any UI/SFTP work begins.
+            self.after(100, lambda p=paths: self._upload_external_paths(p))
+        return "copy"
 
     def _upload_external_paths(self, items):
         if not self.need():
             return
+
         remote_dir = self.path.get().strip() or "/"
         conflicts = self._collect_upload_conflicts(items, remote_dir)
         if not self._confirm_overwrite(conflicts):
             return
 
+        import posixpath
         import threading
 
         def worker():
@@ -174,7 +199,7 @@ class EmberAdmin(_WinSCPApp):
                 total = len(items)
                 for i, item in enumerate(items, 1):
                     self.q.put(("transfer", f"Upload {i}/{total} : {item.name}"))
-                    self._upload_path(item, __import__("posixpath").join(remote_dir, item.name))
+                    self._upload_path(item, posixpath.join(remote_dir, item.name))
                 self.q.put(("transfer", f"Upload complete ({total} item(s))"))
                 self.q.put(("refresh_remote", None))
             except Exception as exc:
